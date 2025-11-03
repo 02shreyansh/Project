@@ -1,0 +1,10 @@
+{
+    "name": "Python 3.11 with EasyOCR",
+    "image": "mcr.microsoft.com/devcontainers/python:0-3.11",
+    "features": {
+        "ghcr.io/devcontainers/features/python:1": {
+            "version": "3.11"
+        }
+    },
+    "postCreateCommand": "pip3 install --user --upgrade pip && pip3 install --user torch==2.0.1 easyocr pillow numpy transformers datasets"
+}
