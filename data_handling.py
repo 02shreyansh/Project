@@ -1,9 +1,36 @@
+import os
+import json
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import (
+    LayoutLMv3Processor,
+    LayoutLMv3ForTokenClassification,
+    LayoutLMv3ForSequenceClassification,
+)
+from datasets import load_dataset, load_from_disk, Dataset as HFDataset
+import easyocr
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Tuple
+import matplotlib.pyplot as plt
+import seaborn as sns
+import spacy
+import re
+from collections import defaultdict
+import warnings
+import glob
+from pathlib import Path
+warnings.filterwarnings('ignore')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
 class DocumentDatasetLoader:
     def __init__(self, cache_dir='./data'):
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
-        # Tesseract is already installed system-wide, no need to initialize
-        print("Tesseract OCR ready")
+        self.reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
 
     def load_invoice_dataset(self):
         invoice_dir = os.path.join(self.cache_dir, 'invoices')
@@ -11,15 +38,15 @@ class DocumentDatasetLoader:
             print("Dataset already downloaded")
         else:
             try:
-                print("Downloading from Kaggle...")
+                print("  Downloading from Kaggle...")
                 os.system(f'kaggle datasets download -d urbikn/sroie-datasetv2 -p {self.cache_dir}/')
-                print("Extracting files...")
+                print("  Extracting files...")
                 os.system(f'unzip -q {self.cache_dir}/sroie-datasetv2.zip -d {invoice_dir}/')
+
                 print("Dataset downloaded and extracted")
             except Exception as e:
                 print(f"Error downloading: {e}")
                 return None
-        
         invoices = []
         img_paths = glob.glob(os.path.join(invoice_dir, '**/*.jpg'), recursive=True) + \
                     glob.glob(os.path.join(invoice_dir, '**/*.png'), recursive=True)
@@ -31,14 +58,12 @@ class DocumentDatasetLoader:
                 image = Image.open(img_path).convert('RGB')
                 txt_path = img_path.replace('.jpg', '.txt').replace('.png', '.txt')
                 text = ""
-                
                 if os.path.exists(txt_path):
                     with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f:
                         text = f.read()
-                
                 if not text:
-                    # Use Tesseract OCR instead of EasyOCR
-                    text = self.perform_ocr(image)
+                    ocr_results = self.perform_ocr(image)
+                    text = ' '.join([r['text'] for r in ocr_results])
 
                 invoices.append({
                     'image': image,
@@ -58,9 +83,8 @@ class DocumentDatasetLoader:
         resume_dir = os.path.join(self.cache_dir, 'resumes')
         try:
             if os.path.exists(resume_dir):
-                print("Loading from disk...")
+                print("  Loading from disk...")
                 dataset = load_from_disk(resume_dir)
-            
             print(f"Dataset structure: {dataset.features}")
             print(f"Total resumes: {len(dataset)}")
             resumes = []
@@ -85,7 +109,6 @@ class DocumentDatasetLoader:
                         text_parts.append(f"\nCERTIFICATIONS:\n{item['certifications']}")
                     if 'achievements' in item and item['achievements']:
                         text_parts.append(f"\nACHIEVEMENTS:\n{item['achievements']}")
-                    
                     full_text = '\n'.join(text_parts)
 
                     if full_text.strip():
@@ -119,7 +142,7 @@ class DocumentDatasetLoader:
             if os.path.exists(papers_dir):
                 dataset = load_from_disk(papers_dir)
             else:
-                print("Downloading from HuggingFace...")
+                print("  Downloading from HuggingFace...")
                 dataset = load_dataset("CShorten/ML-ArXiv-Papers", split="train")
                 dataset.save_to_disk(papers_dir)
 
@@ -165,7 +188,6 @@ class DocumentDatasetLoader:
             font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
         except:
             font = ImageFont.load_default()
-        
         margin = 20
         y = margin
         max_width = img_size[0] - 2 * margin
@@ -186,7 +208,6 @@ class DocumentDatasetLoader:
 
         if current_line:
             lines.append(' '.join(current_line))
-        
         for line in lines[:40]:
             draw.text((margin, y), line, fill='black', font=font)
             y += 15
@@ -196,22 +217,19 @@ class DocumentDatasetLoader:
         return img
 
     def perform_ocr(self, image):
-        """
-        CHANGED: Use Tesseract instead of EasyOCR
-        """
         if isinstance(image, str):
             image = Image.open(image)
-        
-        # Tesseract configuration for better document accuracy
-        config = '--psm 6 --oem 3'  # PSM 6: single block of text, OEM 3: both legacy and neural
-        
-        try:
-            # Extract text using Tesseract
-            text = pytesseract.image_to_string(image, config=config)
-            return text
-        except Exception as e:
-            print(f"Tesseract OCR error: {e}")
-            return ""
+        img_array = np.array(image)
+        results = self.reader.readtext(img_array)
+        ocr_data = []
+        for bbox, text, conf in results:
+            ocr_data.append({
+                'bbox': bbox,
+                'text': text,
+                'confidence': conf
+            })
+
+        return ocr_data
 
     def prepare_mixed_dataset(self):
         datasets_dict = {
@@ -227,6 +245,7 @@ class DocumentDatasetLoader:
                 print(f"{doc_type}: {len(data)} samples")
 
         return datasets_dict
+
 
 class TextPreprocessor:
     def __init__(self):
@@ -272,7 +291,6 @@ class TextPreprocessor:
             if match:
                 fields['invoice_no'] = match.group(1)
                 break
-        
         vendor_patterns = [
             r'(?:from|vendor|company)[\s:]+([A-Z][A-Za-z\s&]+(?:Ltd|Inc|LLC|Pvt|Corp)?)',
         ]
@@ -281,7 +299,6 @@ class TextPreprocessor:
             if match:
                 fields['vendor'] = match.group(1).strip()
                 break
-        
         total_patterns = [
             r'(?:total|amount|grand\s*total)[\s:]*[$₹€£]?\s*([\d,]+\.?\d*)',
             r'[$₹€£]\s*([\d,]+\.?\d*)\s*(?:total)',
@@ -291,7 +308,6 @@ class TextPreprocessor:
             if match:
                 fields['total_amount'] = match.group(1)
                 break
-        
         date_patterns = [
             r'\d{1,2}[-/]\d{1,2}[-/]\d{2,4}',
             r'\d{4}[-/]\d{1,2}[-/]\d{1,2}',
@@ -309,7 +325,6 @@ class TextPreprocessor:
         email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
         if email_match:
             fields['email'] = email_match.group(0)
-        
         phone_patterns = [
             r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b',
             r'\+?\d{1,3}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',
@@ -319,7 +334,6 @@ class TextPreprocessor:
             if match:
                 fields['phone'] = match.group(0)
                 break
-        
         skill_keywords = [
             'python', 'java', 'javascript', 'c\\+\\+', 'c#', 'ruby', 'php', 'swift',
             'machine learning', 'deep learning', 'data science', 'ai', 'artificial intelligence',
@@ -338,11 +352,9 @@ class TextPreprocessor:
 
         if found_skills:
             fields['skills'] = list(set(found_skills))[:10]
-        
         name_match = re.search(r'^([A-Z][a-z]+\s+[A-Z][a-z]+)', text)
         if name_match:
             fields['name'] = name_match.group(1)
-        
         exp_patterns = [
             r'(\d+)\s*(?:\+)?\s*years?\s*(?:of)?\s*experience',
             r'experience[:\s]+(\d+)\s*years?',
@@ -364,11 +376,9 @@ class TextPreprocessor:
             first_line = text.split('\n')[0].strip()
             if len(first_line) > 10:
                 fields['title'] = first_line
-        
         abstract_match = re.search(r'(?:ABSTRACT:|Abstract:)\s*(.+?)(?:\n\n|\Z)', text, re.IGNORECASE | re.DOTALL)
         if abstract_match:
             fields['abstract'] = abstract_match.group(1).strip()[:500]
-        
         keywords_match = re.search(r'(?:KEYWORDS?:|Keywords?:)\s*(.+?)(?:\n|\Z)', text, re.IGNORECASE)
         if keywords_match:
             keywords_text = keywords_match.group(1)
@@ -376,3 +386,32 @@ class TextPreprocessor:
             fields['keywords'] = keywords[:10]
 
         return fields
+
+
+if __name__ == "__main__":
+    loader = DocumentDatasetLoader()
+    preprocessor = TextPreprocessor()
+    datasets = loader.prepare_mixed_dataset()
+    for doc_type, data in datasets.items():
+        if data:
+            print(f"\n{doc_type.upper()} Dataset:")
+            print(f"Number of samples: {len(data)}")
+            if len(data) > 0:
+                sample = data[0]
+                print(f" Sample text preview: {sample['text'][:200]}...")
+
+    for doc_type, data in datasets.items():
+        if data and len(data) > 0:
+            print(f"\n{doc_type.upper()} Sample:")
+            sample_text = data[0]['text']
+
+            if doc_type == 'invoice':
+                fields = preprocessor.extract_invoice_fields(sample_text)
+            elif doc_type == 'resume':
+                fields = preprocessor.extract_resume_fields(sample_text)
+            else:
+                fields = preprocessor.extract_report_fields(sample_text)
+
+            print(f"  Extracted fields: {json.dumps(fields, indent=4)}")
+            entities = preprocessor.extract_entities(sample_text)
+            print(f"  Entities: {json.dumps({k: v[:3] for k, v in entities.items() if v}, indent=4)}")
